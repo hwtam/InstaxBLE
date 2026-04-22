@@ -3,6 +3,8 @@
 from math import ceil
 from struct import pack, unpack_from
 from time import sleep
+import asyncio
+import threading
 
 # Try to import Types with a relative import first
 try:
@@ -53,6 +55,8 @@ class InstaxBLE:
         self.image_path = image_path
         self.verbose = verbose if not self.quiet else False
         self.packetsForPrinting = []
+        self.ready_to_send = threading.Event()  # block when printing
+        self.ready_to_send.set()  # allow sending by default
         self.pos = (0, 0, 0, 0)
         self.batteryState = 0
         self.batteryPercentage = 0
@@ -145,9 +149,13 @@ class InstaxBLE:
             self.handle_image_packet_queue()
 
         elif event == EventType.PRINT_IMAGE_DOWNLOAD_END:
+            if not self.ready_to_send.is_set():
+                self.ready_to_send.set()
             self.handle_image_packet_queue()
 
         elif event == EventType.PRINT_IMAGE_DOWNLOAD_CANCEL:
+            if not self.ready_to_send.is_set():
+                self.ready_to_send.set()
             pass
 
         elif event == EventType.PRINT_IMAGE:
@@ -235,9 +243,16 @@ class InstaxBLE:
                 self.log("Disconnected")
 
     def cancel_print(self):
+        self.cancelled = True
+        if not self.ready_to_send.is_set():
+            self.ready_to_send.set()
         self.packetsForPrinting = []
         self.waitingForResponse = False
         self.send_packet(self.create_packet(EventType.PRINT_IMAGE_DOWNLOAD_CANCEL))
+
+    async def wait_for_send_send(self):
+        wait_task = asyncio.create_task(asyncio.to_thread(self.ready_to_send.wait))
+        await wait_task
 
     def enable_printing(self):
         """ Enable printing. """
@@ -261,7 +276,7 @@ class InstaxBLE:
                     # if foundName.startswith('INSTAX'):
                     #     self.log(f"Found: {foundName} [{foundAddress}]")
                     if (self.deviceName and foundName.startswith(self.deviceName)) or \
-                       (self.deviceAddress and foundAddress == self.deviceAddress) or \
+                       (self.deviceAddress and foundAddress.upper() == self.deviceAddress) or \
                        (self.deviceName is None and self.deviceAddress is None and
                        foundName.startswith('INSTAX-') and foundName.endswith('(IOS)')):
                         # if foundAddress.startswith('FA:AB:BC'):  # start of IOS endpooint
@@ -354,13 +369,36 @@ class InstaxBLE:
                     self.peripheral.write_command(self.serviceUUID, self.writeCharUUID, subPacket)
 
         except KeyboardInterrupt:
-            self.cancelled = True
             self.cancel_print()
             # sleep(1)
             self.disconnect()
             sys.exit('Cancelled')
+            
+    async def wait_for_print_image_download(self, imgSrc) -> bool:
+        if len(self.packetsForPrinting) != 0:
+            return False
+        if not self.ready_to_send.is_set():
+            return False
+        self.ready_to_send.clear()
+        self.print_image_download(imgSrc)
+        self.log("Waiting for all image packets to be sent...")
+        await self.wait_for_send_send()  # waiting for release elsewhere
+        self.log("All image packets sent!")
+        if self.cancelled:
+            return False
+        return True
+        
+    def print_image_after_download(self):
+        if self.printEnabled:
+            self.packetsForPrinting.append(self.create_packet(EventType.PRINT_IMAGE))
+            self.packetsForPrinting.append(self.create_packet((0, 2), b'\x02'))
+            packet = self.packetsForPrinting.pop(0)
+            self.send_packet(packet)
+        else:
+            if not self.quiet:
+                self.log("Printing is disabled")
 
-    def print_image(self, imgSrc):
+    def print_image_download(self, imgSrc):
         """
         print an image. Either pass a path to an image (as a string) or pass
         the bytearray to print directly
@@ -373,11 +411,15 @@ class InstaxBLE:
         imgData = imgSrc
         if isinstance(imgSrc, str):  # if it's a path, load the image contents
             image = Image.open(imgSrc)
-            imgData = self.pil_image_to_bytes(image, max_size_kb=105)
         elif isinstance(imgSrc, BytesIO):
             imgSrc.seek(0)  # Go to the start of the BytesIO object
             image = Image.open(imgSrc)
-            imgData = self.pil_image_to_bytes(image, max_size_kb=105)
+        elif isinstance(imgSrc, Image.Image):
+            image = imgSrc
+        if isinstance(image, Image.Image):
+            image = image.transpose(Image.Transpose.ROTATE_180)
+            imgData = self.pil_image_to_bytes(image, max_size_kb=95)
+            image.save('debug.jpg')
 
         # self.log(f"len of imagedata: {len(imgData)}")
         self.packetsForPrinting = [
@@ -397,11 +439,11 @@ class InstaxBLE:
 
         self.packetsForPrinting.append(self.create_packet(EventType.PRINT_IMAGE_DOWNLOAD_END))
 
-        if self.printEnabled:
-            self.packetsForPrinting.append(self.create_packet(EventType.PRINT_IMAGE))
-            self.packetsForPrinting.append(self.create_packet((0, 2), b'\x02'))
-        elif not self.quiet:
-            self.log("Printing is disabled, sending all packets except the actual print command")
+        # if self.printEnabled:
+        #     self.packetsForPrinting.append(self.create_packet(EventType.PRINT_IMAGE))
+        #     self.packetsForPrinting.append(self.create_packet((0, 2), b'\x02'))
+        # elif not self.quiet:
+        #     self.log("Printing is disabled, sending all packets except the actual print command")
 
         # for packet in self.packetsForPrinting:
         #     self.log(self.prettify_bytearray(packet))
@@ -506,7 +548,7 @@ class InstaxBLE:
         sleep(60)
 
 
-def main(args={}):
+async def main(args={}):
     """ Example usage of the InstaxBLE class """
     instax = InstaxBLE(**args)
     try:
@@ -516,11 +558,14 @@ def main(args={}):
         # this script
 
         # instax.enable_printing()
-        instax.connect()
+        instax.connect(timeout=30)
+        if not instax.peripheral or not instax.peripheral.is_connected():
+            instax.log("Failed to connect to printer")
+            return
         # Set a rainbow effect to be shown while printing and a pulsating
         # green effect when printing is done
-        instax.send_led_pattern(LedPatterns.rainbow, when=1)
-        instax.send_led_pattern(LedPatterns.pulseGreen, when=2)
+        # instax.send_led_pattern(LedPatterns.rainbow, when=1)
+        # instax.send_led_pattern(LedPatterns.pulseGreen, when=2)
         # you can also read the current accelerometer values if you want
         # while True:
         #     instax.get_printer_orientation()
@@ -530,10 +575,19 @@ def main(args={}):
         # passing the image_path as an argument when calling
         # this script, or by specifying the path in your code
         if instax.image_path:
-            instax.print_image(instax.image_path)
+            if not (await instax.wait_for_print_image_download(instax.image_path)):
+                instax.log("Failed to download image to printer")
+                return
+            await asyncio.sleep(30)
+            instax.print_image_after_download()
         else:
-            instax.print_image(instax.printerSettings['exampleImage'])
-        instax.wait_one_minute()
+            if not (await instax.wait_for_print_image_download(instax.printerSettings['exampleImage'])):
+                instax.log("Failed to download example image to printer")
+                return
+            await asyncio.sleep(30)
+            instax.print_image_after_download()
+        # instax.wait_one_minute()
+        await asyncio.sleep(20)
 
     except Exception as e:
         print(type(e).__name__, __file__, e.__traceback__.tb_lineno)
@@ -554,4 +608,4 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--image-path', help='Path to the image file')
     args = parser.parse_args()
 
-    main(vars(args))
+    asyncio.run(main(vars(args)))
